@@ -208,3 +208,89 @@ Behavior-focused tests, not implementation-detail assertions:
 - Optional enhancements (balance API, transfer history API, metrics) are
   listed in `ASSIGNMENT.md` as nice-to-haves and are addressed only if time
   permits after the core requirements above are solid.
+
+## 9. How to Run & Test
+
+### Prerequisites
+
+- Go 1.24+
+- Docker (for local PostgreSQL)
+
+### 1. Start PostgreSQL
+
+```bash
+docker compose up -d postgres
+```
+
+This starts Postgres on `localhost:5432` and automatically applies
+[`migrations/001_init.sql`](./migrations/001_init.sql) on first boot (via the
+container's `docker-entrypoint-initdb.d` mechanism). Check it's healthy:
+
+```bash
+docker compose ps
+```
+
+### 2. Run the HTTP server
+
+```bash
+go run ./cmd/server
+```
+
+By default the server listens on `:8080` and connects to
+`postgres://postgres:postgres@localhost:5432/wallet_transfer?sslmode=disable`.
+Both are overridable via environment variables:
+
+```text
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/wallet_transfer?sslmode=disable
+HTTP_ADDR=:8080
+```
+
+### 3. Exercise the API manually
+
+```bash
+curl -X POST localhost:8080/wallets -d '{"id":"wallet_1","startingBalance":1000}'
+curl -X POST localhost:8080/wallets -d '{"id":"wallet_2","startingBalance":0}'
+
+curl -X POST localhost:8080/transfers -d '{
+  "idempotencyKey":"abc123",
+  "fromWalletId":"wallet_1",
+  "toWalletId":"wallet_2",
+  "amount":100
+}'
+
+# replay with the same idempotencyKey: returns the identical transfer result,
+# no additional balance/ledger changes
+curl -X POST localhost:8080/transfers -d '{
+  "idempotencyKey":"abc123",
+  "fromWalletId":"wallet_1",
+  "toWalletId":"wallet_2",
+  "amount":100
+}'
+
+curl localhost:8080/wallets/wallet_1   # -> balance 900
+curl localhost:8080/wallets/wallet_2   # -> balance 100
+curl localhost:8080/transfers/<id>
+```
+
+### 4. Run the automated tests
+
+The tests in [`tests/`](./tests) run against a real Postgres instance (they
+call `t.Skip` automatically if one isn't reachable, so `go test ./...`
+remains safe to run without a database available):
+
+```bash
+docker compose up -d postgres
+go test ./... -v
+```
+
+Point tests at a different database with `TEST_DATABASE_URL`. The suite
+covers the happy path, sequential and concurrent duplicate-idempotency-key
+replay, concurrent debits on the same wallet (verifying no lost updates /
+double spend), insufficient funds, and request validation.
+
+### 5. Lint / format check
+
+```bash
+go vet ./...
+gofmt -l .      # should print nothing
+```
