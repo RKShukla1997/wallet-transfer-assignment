@@ -98,61 +98,48 @@ Client -> Handler -> Service.CreateTransfer(ctx, req)
 
 ## 2. Design Decisions & Trade-offs
 
-This section explains *why* each major choice was made, including the
-alternatives that were considered and rejected, and includes a sequence
-view of the request flow focused on the decisions rather than the code.
+A few choices weren't obvious and are worth calling out explicitly,
+including one I got wrong on the first pass.
 
-### 2.1 High-level request sequence
+**Idempotency via `INSERT ... ON CONFLICT DO NOTHING`, not a separate table.**
+My first instinct was a `SELECT` to check for an existing key, then `INSERT`
+if nothing came back — but that's a race: two concurrent requests with the
+same key can both pass the `SELECT` before either commits the `INSERT`.
+Using the unique constraint as the arbiter (`ON CONFLICT DO NOTHING RETURNING
+*`, fetch on a miss) closes that race without any extra locking, and avoids
+having a second table that can drift out of sync with `transfers`.
 
-```text
- Client            Handler             Service              Repository            PostgreSQL
-   │   POST /transfers  │                   │                     │                     │
-   │ ───────────────────▶                   │                     │                     │
-   │                    │ decode + shape    │                     │                     │
-   │                    │ validation only   │                     │                     │
-   │                    │ ─────────────────▶│                     │                     │
-   │                    │                   │ Validate() (domain) │                     │
-   │                    │                   │ ───────────────────▶│                     │
-   │                    │                   │                     │  BEGIN              │
-   │                    │                   │                     │ ───────────────────▶│
-   │                    │                   │ LockTwoForUpdate    │                     │
-   │                    │                   │ ───────────────────▶│ SELECT ... FOR UPDATE
-   │                    │                   │                     │ ───────────────────▶│
-   │                    │                   │ InsertIfAbsent      │                     │
-   │                    │                   │ ───────────────────▶│ INSERT ... ON CONFLICT
-   │                    │                   │                     │ ───────────────────▶│
-   │                    │                   │        ┌────────────┴─────────────┐       │
-   │                    │                   │        │ new row?                 │       │
-   │                    │                   │        │  no  -> fetch existing,  │       │
-   │                    │                   │        │        skip to COMMIT    │       │
-   │                    │                   │        │  yes -> continue below   │       │
-   │                    │                   │        └────────────┬─────────────┘       │
-   │                    │                   │ check balance, UpdateBalance x2,           │
-   │                    │                   │ InsertDoubleEntry, MarkProcessed/Failed    │
-   │                    │                   │ ───────────────────▶│ UPDATE / INSERT x N │
-   │                    │                   │                     │ ───────────────────▶│
-   │                    │                   │                     │  COMMIT             │
-   │                    │                   │                     │ ───────────────────▶│
-   │                    │  transfer result  │◀────────────────────│                     │
-   │  HTTP response     │◀──────────────────│                     │                     │
-   │◀───────────────────│                   │                     │                     │
-```
+**Lock the wallets before inserting the transfer row — found by testing,
+not by design.** I originally locked the wallets inside `execute()`, after
+the transfer row was already inserted. That passed the happy-path tests but
+deadlocked under `TestCreateTransfer_ConcurrentDebitsOnSameWallet`: inserting
+into `transfers` takes an implicit FK lock on both wallet rows, so by the
+time several concurrent transactions each tried to upgrade that implicit
+lock to an explicit `FOR UPDATE`, they deadlocked on each other. Moving the
+`SELECT ... FOR UPDATE` to happen *before* the insert fixed it — the later
+implicit lock becomes a no-op for the transaction that already holds the
+stronger lock. Wallets are also always locked in sorted-id order regardless
+of transfer direction, which is the more "textbook" half of avoiding
+deadlocks here; the ordering-before-insert part is the part I actually had
+to debug.
 
-### 2.2 Decisions and alternatives considered
+**A failed transfer still commits.** Insufficient funds marks the transfer
+`FAILED` and commits, rather than rolling back and returning an error. That
+way a retry with the same idempotency key replays the same `FAILED` result
+instead of re-checking a balance that may have changed in the meantime.
 
-| Decision | Chosen approach | Alternatives considered | Why chosen |
-|---|---|---|---|
-| Datastore | PostgreSQL | SQLite, MongoDB | Assignment's preferred option; strong transactional guarantees (MVCC, `SELECT ... FOR UPDATE`, unique constraints) that map directly onto the idempotency/concurrency requirements. SQLite is an acceptable fallback but doesn't demonstrate row-level locking as clearly under real concurrency. |
-| Idempotency storage | Unique constraint on `transfers.idempotency_key`, no separate table | Dedicated `idempotency_records` table mapping key -> cached response | A separate table would need to be kept in sync with `transfers` and raises the question "what if they disagree?" — an extra failure mode with no added guarantee. Folding the key into `transfers` makes the row **the** record of whether a request has been seen, enforced by the database itself rather than application logic. |
-| Idempotency detection mechanism | `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`, then fetch on miss | Read-then-write (`SELECT` to check existence, then `INSERT` if absent) | Read-then-write has a race: two concurrent requests with the same key can both see "no existing row" and both proceed to insert, before the unique constraint can be relied on. The atomic `INSERT ... ON CONFLICT` makes the database itself the single arbiter of "is this new," closing that race without any explicit locking. |
-| Concurrency control for balances | Pessimistic locking: `SELECT ... FOR UPDATE` on both wallets, in a stable sorted order, inside one transaction | Optimistic locking (a `version` column checked on `UPDATE ... WHERE version = $x`) | Transfers are a write-heavy, contention-prone path (the same hot wallet can be debited by many concurrent transfers), where optimistic locking would mean frequent client-visible retries. Pessimistic locking lets conflicting transfers simply queue briefly instead of failing and having to be retried by the caller, which is simpler to reason about and keeps the API's exactly-once guarantee intact without extra retry logic in the service layer. |
-| Lock acquisition order | Always lock the two wallets sorted by id, **before** inserting the transfer row | Lock in `(from, to)` request order; or lock only after inserting the transfer row | Locking in request order can deadlock: transfer A→B and transfer B→A running concurrently would lock in opposite orders. Sorting by id fixes a single global order. Locking *before* the insert also avoids a subtler deadlock: inserting into `transfers` takes an implicit foreign-key row lock on both wallets, and if that implicit lock were taken before the explicit `FOR UPDATE` lock, many concurrent transactions each holding their own implicit lock would deadlock trying to upgrade to exclusive access on the same row. This was caught by the concurrency test (`TestCreateTransfer_ConcurrentDebitsOnSameWallet`) during development — see the commit history for the before/after. |
-| Balance check timing | After the row lock is acquired | Checking balance from an earlier, unlocked read | A read before the lock is a classic read-then-write race: two concurrent transfers could both read a sufficient balance before either writes. Checking after the lock is held guarantees no other transaction can change the balance out from under this one. |
-| Insufficient funds handling | Mark the transfer `FAILED` and **commit** | Roll back the transaction and return an error | Insufficient funds is a normal business outcome, not an infrastructure failure. Committing a `FAILED` transfer means a retry with the same idempotency key deterministically replays the same `FAILED` result, rather than re-evaluating balances that may have changed since (which would break the "same key -> same result" guarantee). |
-| Money representation | Integer minor units (`int64`, e.g. cents) | Floating point, or a `numeric`/decimal type | Floating point introduces rounding error that is unacceptable for a ledger. Integers in minor units are exact, simple to reason about, and map cleanly onto Go's `int64` without needing a decimal library. |
-| Ledger writes | Always write DEBIT + CREDIT together via a single `InsertDoubleEntry` call | Allow callers to write individual ledger entries | A single call that always writes both sides makes it structurally impossible for the service layer to produce an unbalanced ledger (one entry without its pair). This is enforced by code shape, not just convention. |
-| Transaction boundary | One DB transaction per `CreateTransfer` call, covering locking, idempotency insert, balance mutation, and ledger writes | Multiple smaller transactions (e.g., one for idempotency, one for the transfer) | Multiple transactions would reintroduce the exact race conditions idempotency and locking are meant to prevent (a crash between transactions could leave a `PENDING` transfer with no resolution). One transaction means the whole operation is atomic: it either fully commits or fully rolls back. |
-| Layering | Handler → Service → Repository → Domain, each with a single responsibility | A "fat" handler or a single `transfer.go` file mixing SQL and business rules | Keeping business rules (idempotency, locking order, balance rules, state transitions) exclusively in the service layer, and SQL exclusively in the repository layer, makes each layer independently testable and keeps the repository free of workflow decisions — directly addressing the evaluation rubric's "repositories limited to persistence concerns" criterion. |
+**Single transaction per transfer.** Locking, the idempotency insert,
+balance updates, and ledger writes all happen in one DB transaction.
+Splitting it up would reopen the exact races idempotency and locking exist
+to close (e.g. a crash between two transactions leaving a `PENDING` transfer
+nobody resolves).
+
+Things I considered and skipped, given the time box: an outbox/event table
+for downstream consumers (no requirement for it here, and it adds
+complexity the assignment doesn't ask for), and optimistic (version-column)
+locking instead of `FOR UPDATE` — optimistic locking pushes retries onto the
+caller, which doesn't fit an API that's supposed to be exactly-once from
+the client's point of view.
 
 ## 3. Database Schema
 
@@ -289,6 +276,17 @@ Behavior-focused tests, not implementation-detail assertions:
 - Optional enhancements (balance API, transfer history API, metrics) are
   listed in `ASSIGNMENT.md` as nice-to-haves and are addressed only if time
   permits after the core requirements above are solid.
+- `go test` didn't have `-race` available locally (it needs cgo, and I
+  didn't have a C toolchain set up on this machine), so the concurrency
+  guarantees are verified via real-Postgres concurrent scenarios
+  (`TestCreateTransfer_ConcurrentDebitsOnSameWallet` etc.) instead of the
+  Go race detector. That's an acceptable substitute here since the actual
+  safety guarantee comes from Postgres row locks, not in-process goroutine
+  synchronization — but I'd still want `-race` in CI given more time.
+- No retry/backoff on transient Postgres errors (e.g. connection drop
+  mid-transaction) — the client is expected to retry the whole request,
+  which is safe because of idempotency, but the server itself doesn't retry
+  internally.
 
 ## 10. How to Run & Test
 

@@ -71,22 +71,11 @@ func (s *TransferService) CreateTransfer(ctx context.Context, in CreateTransferI
 	var result domain.Transfer
 
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
-		// Lock both wallets in a stable order (by id) BEFORE inserting the
-		// transfer row, and before knowing whether this request is new or
-		// a duplicate replay.
-		//
-		// This ordering matters: inserting into `transfers` triggers an
-		// implicit foreign-key row lock on both wallet rows. If that
-		// implicit lock were taken first and the explicit `FOR UPDATE`
-		// lock requested afterwards, many concurrent transactions each
-		// holding their own implicit shared lock on the same wallet row
-		// would simultaneously try to upgrade to an exclusive lock,
-		// producing a lock-upgrade deadlock under load. Acquiring the
-		// explicit exclusive lock first means the later implicit
-		// FK-driven lock is a no-op for the lock holder (same
-		// transaction, already holds the stronger lock) and other
-		// transactions simply queue for it — no upgrade cycle, no
-		// deadlock.
+		// Lock both wallets (sorted by id) before inserting the transfer
+		// row. Locking after the insert deadlocks under concurrency: the
+		// insert's implicit FK lock on the wallet rows collides with the
+		// explicit FOR UPDATE lock requested afterwards. See "Design
+		// Decisions" in solution.md for how this was found.
 		fromWallet, toWallet, err := s.walletRepo.LockTwoForUpdate(ctx, tx, candidate.FromWalletID, candidate.ToWalletID)
 		if err != nil {
 			return fmt.Errorf("locking wallets: %w", err)
